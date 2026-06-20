@@ -1,5 +1,4 @@
-直播来源：“https://live.zbds.top/tv/iptv4.txt”“https://raw.githubusercontent.com/BurningC4/Chinese-IPTV/master/TV-IPV4.m3u”
-
+直播来源：“https://zuodashuang-beep.github.io/kaifang/IPTV_OK.txt”
 最新版本：“0.0.1”
 
 更新地址：“”
