@@ -1,8 +1,8 @@
-name: Sync IPTV
+name: Sync and Check IPTV
 
 on:
   schedule:
-    # 每 6 小时运行一次（UTC 时间）
+    # 每 6 小时执行一次（UTC）
     - cron: "17 */6 * * *"
   workflow_dispatch:
 
@@ -10,18 +10,27 @@ permissions:
   contents: write
 
 concurrency:
-  group: sync-iptv
+  group: sync-check-iptv
   cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download IPTV data
+      - name: Ensure ffprobe is available
+        shell: bash
+        run: |
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+      - name: Download source list
         shell: bash
         run: |
           set -euo pipefail
@@ -36,14 +45,222 @@ jobs:
             --connect-timeout 30 \
             --max-time 180 \
             "https://live.zbds.top/tv/iptv4.txt" \
-            --output IPTV_OK.txt.tmp
+            --output IPTV_SOURCE.txt
 
-          if [ ! -s IPTV_OK.txt.tmp ]; then
-            echo "下载失败：文件为空"
+          if [ ! -s IPTV_SOURCE.txt ]; then
+            echo "下载失败：源文件为空"
             exit 1
           fi
 
+      - name: Check IPTV links
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          SOURCE = Path("IPTV_SOURCE.txt")
+          OUTPUT = Path("IPTV_OK.txt.tmp")
+
+          # 单条链接最长检测时间
+          CHECK_TIMEOUT = 15
+
+          # 同时检测的链接数
+          MAX_WORKERS = 24
+
+          raw_text = SOURCE.read_text(
+              encoding="utf-8",
+              errors="ignore"
+          ).replace("\r\n", "\n")
+
+          sections = []
+          current_section = None
+          entries = []
+
+          for original_line in raw_text.splitlines():
+              line = original_line.strip()
+
+              if not line:
+                  continue
+
+              if line.endswith(",#genre#"):
+                  current_section = line
+                  sections.append({
+                      "header": line,
+                      "entries": []
+                  })
+                  continue
+
+              if "," not in line:
+                  continue
+
+              name, url = line.split(",", 1)
+              name = name.strip()
+              url = url.strip()
+
+              if not name or not url:
+                  continue
+
+              # GitHub 云服务器无法检测局域网 UDP 组播
+              if not url.lower().startswith(("http://", "https://")):
+                  print(f"跳过不支持的协议: {name} -> {url}")
+                  continue
+
+              entry = {
+                  "section": current_section,
+                  "name": name,
+                  "url": url,
+                  "line": f"{name},{url}"
+              }
+              entries.append(entry)
+
+              if not sections:
+                  sections.append({
+                      "header": None,
+                      "entries": []
+                  })
+
+              sections[-1]["entries"].append(entry)
+
+          if not entries:
+              print("错误：源文件中没有找到 HTTP/HTTPS 播放链接")
+              sys.exit(1)
+
+          def check_stream(entry):
+              url = entry["url"]
+              started = time.monotonic()
+
+              command = [
+                  "ffprobe",
+                  "-v", "error",
+                  "-rw_timeout", str(CHECK_TIMEOUT * 1_000_000),
+                  "-analyzeduration", "2000000",
+                  "-probesize", "2000000",
+                  "-show_entries", "stream=codec_type",
+                  "-of", "csv=p=0",
+                  url
+              ]
+
+              try:
+                  result = subprocess.run(
+                      command,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                      timeout=CHECK_TIMEOUT
+                  )
+
+                  elapsed = round(time.monotonic() - started, 2)
+                  stream_types = result.stdout.lower()
+
+                  playable = (
+                      result.returncode == 0
+                      and (
+                          "video" in stream_types
+                          or "audio" in stream_types
+                      )
+                  )
+
+                  return entry, playable, elapsed
+
+              except subprocess.TimeoutExpired:
+                  elapsed = round(time.monotonic() - started, 2)
+                  return entry, False, elapsed
+
+              except Exception as error:
+                  print(f"检测异常: {entry['name']}: {error}")
+                  return entry, False, 0
+
+          valid_urls = set()
+
+          print(f"开始检测 {len(entries)} 条播放地址……")
+
+          with concurrent.futures.ThreadPoolExecutor(
+              max_workers=MAX_WORKERS
+          ) as executor:
+              futures = [
+                  executor.submit(check_stream, entry)
+                  for entry in entries
+              ]
+
+              completed = 0
+
+              for future in concurrent.futures.as_completed(futures):
+                  entry, playable, elapsed = future.result()
+                  completed += 1
+
+                  if playable:
+                      valid_urls.add(entry["url"])
+                      status = "可播放"
+                  else:
+                      status = "失效"
+
+                  print(
+                      f"[{completed}/{len(entries)}] "
+                      f"{status} {elapsed}s "
+                      f"{entry['name']} -> {entry['url']}"
+                  )
+
+          output_lines = []
+          written_urls = set()
+          valid_count = 0
+
+          for section in sections:
+              valid_entries = []
+
+              for entry in section["entries"]:
+                  url = entry["url"]
+
+                  if url not in valid_urls:
+                      continue
+
+                  # 删除完全重复的播放地址
+                  if url in written_urls:
+                      continue
+
+                  written_urls.add(url)
+                  valid_entries.append(entry["line"])
+
+              if not valid_entries:
+                  continue
+
+              if output_lines:
+                  output_lines.append("")
+
+              if section["header"]:
+                  output_lines.append(section["header"])
+
+              output_lines.extend(valid_entries)
+              valid_count += len(valid_entries)
+
+          # 防止检测环境整体故障时清空原文件
+          if valid_count < 10:
+              print(
+                  f"错误：只检测到 {valid_count} 条有效链接，"
+                  "可能是 GitHub 网络或检测环境异常，拒绝覆盖原文件。"
+              )
+              sys.exit(1)
+
+          OUTPUT.write_text(
+              "\n".join(output_lines) + "\n",
+              encoding="utf-8"
+          )
+
+          print(f"检测完成：")
+          print(f"源链接数量：{len(entries)}")
+          print(f"有效链接数量：{valid_count}")
+          print(f"失效链接数量：{len(entries) - valid_count}")
+          PY
+
+      - name: Replace IPTV_OK.txt
+        shell: bash
+        run: |
+          set -euo pipefail
           mv IPTV_OK.txt.tmp IPTV_OK.txt
+          rm -f IPTV_SOURCE.txt
 
       - name: Commit and push changes
         shell: bash
@@ -51,13 +268,14 @@ jobs:
           set -euo pipefail
 
           if git diff --quiet -- IPTV_OK.txt; then
-            echo "内容没有变化，无需提交"
+            echo "有效链接列表没有变化，无需提交"
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add IPTV_OK.txt
-          git commit -m "自动同步 IPTV 数据"
+          git commit -m "自动检测并更新 IPTV 链接"
           git push
