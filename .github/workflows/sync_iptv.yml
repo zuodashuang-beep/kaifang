@@ -1,8 +1,8 @@
-name: Sync and Check IPTV
+name: Sync IPTV
 
 on:
   schedule:
-    # 每 6 小时执行一次（UTC）
+    # 每 6 小时执行一次
     - cron: "17 */6 * * *"
   workflow_dispatch:
 
@@ -10,257 +10,516 @@ permissions:
   contents: write
 
 concurrency:
-  group: sync-check-iptv
+  group: sync-iptv
   cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Ensure ffprobe is available
-        shell: bash
-        run: |
-          if ! command -v ffprobe >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y ffmpeg
-          fi
-
-      - name: Download source list
+      - name: Download IPTV sources
         shell: bash
         run: |
           set -euo pipefail
 
-          curl \
-            --fail \
-            --location \
-            --silent \
-            --show-error \
-            --retry 3 \
-            --retry-all-errors \
-            --connect-timeout 30 \
-            --max-time 180 \
+          download() {
+            local url="$1"
+            local output="$2"
+
+            curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --retry 3 \
+              --retry-all-errors \
+              --connect-timeout 20 \
+              --max-time 180 \
+              "$url" \
+              --output "$output"
+
+            if [ ! -s "$output" ]; then
+              echo "下载失败或内容为空：$url"
+              exit 1
+            fi
+          }
+
+          download \
             "https://live.zbds.top/tv/iptv4.txt" \
-            --output IPTV_SOURCE.txt
+            "source-1.txt"
 
-          if [ ! -s IPTV_SOURCE.txt ]; then
-            echo "下载失败：源文件为空"
-            exit 1
-          fi
+          download \
+            "https://raw.githubusercontent.com/suxuang/myIPTV/main/ipv4.m3u" \
+            "source-2.m3u"
 
-      - name: Check IPTV links
+          download \
+            "https://live.445569.xyz/live.m3u" \
+            "source-3.m3u"
+
+      - name: Parse and check links
         shell: bash
         run: |
           python3 - <<'PY'
           import concurrent.futures
+          import re
           import subprocess
           import sys
-          import time
+          import unicodedata
+          from collections import OrderedDict
           from pathlib import Path
 
-          SOURCE = Path("IPTV_SOURCE.txt")
-          OUTPUT = Path("IPTV_OK.txt.tmp")
+          CONNECT_TIMEOUT = 6
+          TOTAL_TIMEOUT = 12
+          MAX_WORKERS = 32
 
-          # 单条链接最长检测时间
-          CHECK_TIMEOUT = 15
-
-          # 同时检测的链接数
-          MAX_WORKERS = 24
-
-          raw_text = SOURCE.read_text(
-              encoding="utf-8",
-              errors="ignore"
-          ).replace("\r\n", "\n")
-
-          sections = []
-          current_section = None
           entries = []
+          seen_urls = set()
 
-          for original_line in raw_text.splitlines():
-              line = original_line.strip()
+          def read_text(path):
+              return Path(path).read_text(
+                  encoding="utf-8",
+                  errors="ignore",
+              ).replace("\r\n", "\n")
 
-              if not line:
-                  continue
+          def extract_attribute(text, name):
+              pattern = rf'{re.escape(name)}="([^"]*)"'
+              match = re.search(
+                  pattern,
+                  text,
+                  flags=re.IGNORECASE,
+              )
+              return match.group(1).strip() if match else None
 
-              if line.endswith(",#genre#"):
-                  current_section = line
-                  sections.append({
-                      "header": line,
-                      "entries": []
-                  })
-                  continue
-
-              if "," not in line:
-                  continue
-
-              name, url = line.split(",", 1)
+          def normalize_name(name):
+              name = unicodedata.normalize("NFKC", name)
               name = name.strip()
+
+              # 删除名称两端的常见质量标识
+              name = re.sub(
+                  r"[\[\(（【]\s*"
+                  r"(?:高清|超清|标清|蓝光|HD|FHD)"
+                  r"\s*[\]\)）】]",
+                  "",
+                  name,
+                  flags=re.IGNORECASE,
+              )
+
+              name = re.sub(
+                  r"[\s\-_]+(?:高清|超清|标清|HD|FHD)$",
+                  "",
+                  name,
+                  flags=re.IGNORECASE,
+              )
+
+              # 统一 CCTV 写法
+              name = re.sub(
+                  r"^(?:央视|CCTV)[\s\-_]*(\d+)"
+                  r"[\s\-_]*(?:PLUS|P|\+)",
+                  lambda m: f"CCTV{m.group(1)}+",
+                  name,
+                  flags=re.IGNORECASE,
+              )
+
+              name = re.sub(
+                  r"^(?:央视|CCTV)[\s\-_]*(\d+)",
+                  lambda m: f"CCTV{m.group(1)}",
+                  name,
+                  flags=re.IGNORECASE,
+              )
+
+              name = re.sub(
+                  r"^CCTV[\s\-_]*",
+                  "CCTV",
+                  name,
+                  flags=re.IGNORECASE,
+              )
+
+              # 统一常见频道名称
+              replacements = {
+                  "中央一套": "CCTV1",
+                  "中央二套": "CCTV2",
+                  "中央三套": "CCTV3",
+                  "中央四套": "CCTV4",
+                  "中央五套": "CCTV5",
+                  "中央六套": "CCTV6",
+                  "中央七套": "CCTV7",
+                  "中央八套": "CCTV8",
+                  "中央九套": "CCTV9",
+                  "中央十套": "CCTV10",
+                  "中央十一套": "CCTV11",
+                  "中央十二套": "CCTV12",
+                  "中央十三套": "CCTV13",
+                  "中央十四套": "CCTV14",
+                  "中央十五套": "CCTV15",
+                  "中央十六套": "CCTV16",
+                  "中央十七套": "CCTV17",
+                  "CCTV5PLUS": "CCTV5+",
+                  "CCTV5P": "CCTV5+",
+              }
+
+              upper_name = name.upper()
+
+              if upper_name in replacements:
+                  name = replacements[upper_name]
+              elif name in replacements:
+                  name = replacements[name]
+
+              # 合并多余空格
+              name = re.sub(r"\s+", " ", name).strip()
+
+              return name or "未命名频道"
+
+          def normalize_group(group, channel_name):
+              text = f"{group} {channel_name}"
+
+              if re.search(
+                  r"CCTV|央视|中央电视台|CGTN|CETV",
+                  text,
+                  flags=re.IGNORECASE,
+              ):
+                  return "央视频道"
+
+              if "卫视" in text:
+                  return "卫视频道"
+
+              if re.search(
+                  r"香港|澳门|台湾|TVB|凤凰",
+                  text,
+                  flags=re.IGNORECASE,
+              ):
+                  return "港澳台频道"
+
+              if re.search(
+                  r"地方|市台|县台|省内",
+                  text,
+                  flags=re.IGNORECASE,
+              ):
+                  return "地方频道"
+
+              return "其他频道"
+
+          def add_entry(
+              group,
+              name,
+              url,
+              user_agent=None,
+              referer=None,
+          ):
+              name = normalize_name(name)
               url = url.strip()
 
-              if not name or not url:
-                  continue
+              if not url.lower().startswith(
+                  ("http://", "https://")
+              ):
+                  return
 
-              # GitHub 云服务器无法检测局域网 UDP 组播
-              if not url.lower().startswith(("http://", "https://")):
-                  print(f"跳过不支持的协议: {name} -> {url}")
-                  continue
+              # 完全相同的播放地址只保留一次
+              if url in seen_urls:
+                  return
 
-              entry = {
-                  "section": current_section,
+              seen_urls.add(url)
+
+              entries.append({
+                  "group": normalize_group(group, name),
                   "name": name,
                   "url": url,
-                  "line": f"{name},{url}"
-              }
-              entries.append(entry)
+                  "user_agent": user_agent,
+                  "referer": referer,
+              })
 
-              if not sections:
-                  sections.append({
-                      "header": None,
-                      "entries": []
-                  })
+          def parse_txt(path):
+              current_group = "其他频道"
 
-              sections[-1]["entries"].append(entry)
+              for original_line in read_text(path).splitlines():
+                  line = original_line.strip()
+
+                  if not line:
+                      continue
+
+                  if line.endswith(",#genre#"):
+                      current_group = line.rsplit(",", 1)[0]
+                      continue
+
+                  if "," not in line:
+                      continue
+
+                  name, url = line.split(",", 1)
+
+                  add_entry(
+                      current_group,
+                      name,
+                      url,
+                  )
+
+          def parse_m3u(path):
+              pending = None
+
+              for original_line in read_text(path).splitlines():
+                  line = original_line.strip()
+
+                  if not line:
+                      continue
+
+                  if line.startswith("#EXTINF:"):
+                      name = (
+                          line.rsplit(",", 1)[1].strip()
+                          if "," in line
+                          else "未命名频道"
+                      )
+
+                      pending = {
+                          "name": name,
+                          "group": (
+                              extract_attribute(
+                                  line,
+                                  "group-title",
+                              )
+                              or "其他频道"
+                          ),
+                          "user_agent": (
+                              extract_attribute(
+                                  line,
+                                  "http-user-agent",
+                              )
+                              or extract_attribute(
+                                  line,
+                                  "user-agent",
+                              )
+                          ),
+                          "referer": (
+                              extract_attribute(
+                                  line,
+                                  "http-referer",
+                              )
+                              or extract_attribute(
+                                  line,
+                                  "http-referrer",
+                              )
+                          ),
+                      }
+                      continue
+
+                  # 忽略注释和被注释掉的链接
+                  if line.startswith("#"):
+                      continue
+
+                  if (
+                      pending
+                      and line.lower().startswith(
+                          ("http://", "https://")
+                      )
+                  ):
+                      add_entry(
+                          pending["group"],
+                          pending["name"],
+                          line,
+                          pending["user_agent"],
+                          pending["referer"],
+                      )
+                      pending = None
+
+          parse_txt("source-1.txt")
+          parse_m3u("source-2.m3u")
+          parse_m3u("source-3.m3u")
 
           if not entries:
-              print("错误：源文件中没有找到 HTTP/HTTPS 播放链接")
+              print("没有解析到播放链接")
               sys.exit(1)
 
-          def check_stream(entry):
-              url = entry["url"]
-              started = time.monotonic()
-
+          def check_url(entry):
               command = [
-                  "ffprobe",
-                  "-v", "error",
-                  "-rw_timeout", str(CHECK_TIMEOUT * 1_000_000),
-                  "-analyzeduration", "2000000",
-                  "-probesize", "2000000",
-                  "-show_entries", "stream=codec_type",
-                  "-of", "csv=p=0",
-                  url
+                  "curl",
+                  "--location",
+                  "--silent",
+                  "--show-error",
+                  "--connect-timeout",
+                  str(CONNECT_TIMEOUT),
+                  "--max-time",
+                  str(TOTAL_TIMEOUT),
+                  "--range",
+                  "0-2047",
+                  "--max-filesize",
+                  "65536",
+                  "--output",
+                  "/dev/null",
+                  "--write-out",
+                  "%{http_code}|%{size_download}",
               ]
+
+              if entry["user_agent"]:
+                  command.extend([
+                      "--user-agent",
+                      entry["user_agent"],
+                  ])
+
+              if entry["referer"]:
+                  command.extend([
+                      "--referer",
+                      entry["referer"],
+                  ])
+
+              command.append(entry["url"])
 
               try:
                   result = subprocess.run(
                       command,
                       stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL,
                       text=True,
-                      timeout=CHECK_TIMEOUT
+                      timeout=TOTAL_TIMEOUT + 3,
                   )
 
-                  elapsed = round(time.monotonic() - started, 2)
-                  stream_types = result.stdout.lower()
+                  output = result.stdout.strip()
+                  parts = output.split("|")
 
-                  playable = (
-                      result.returncode == 0
-                      and (
-                          "video" in stream_types
-                          or "audio" in stream_types
-                      )
+                  if len(parts) != 2:
+                      return entry, False
+
+                  try:
+                      status_code = int(parts[0])
+                      downloaded = float(parts[1])
+                  except ValueError:
+                      return entry, False
+
+                  # HTTP 成功并且确实返回了内容
+                  reachable = (
+                      200 <= status_code < 400
+                      and downloaded > 0
                   )
 
-                  return entry, playable, elapsed
+                  return entry, reachable
 
-              except subprocess.TimeoutExpired:
-                  elapsed = round(time.monotonic() - started, 2)
-                  return entry, False, elapsed
+              except Exception:
+                  return entry, False
 
-              except Exception as error:
-                  print(f"检测异常: {entry['name']}: {error}")
-                  return entry, False, 0
+          reachable_entries = []
+          total = len(entries)
 
-          valid_urls = set()
-
-          print(f"开始检测 {len(entries)} 条播放地址……")
+          print(f"共解析到 {total} 条唯一播放地址")
 
           with concurrent.futures.ThreadPoolExecutor(
               max_workers=MAX_WORKERS
           ) as executor:
               futures = [
-                  executor.submit(check_stream, entry)
+                  executor.submit(check_url, entry)
                   for entry in entries
               ]
 
-              completed = 0
+              for index, future in enumerate(
+                  concurrent.futures.as_completed(futures),
+                  start=1,
+              ):
+                  entry, reachable = future.result()
 
-              for future in concurrent.futures.as_completed(futures):
-                  entry, playable, elapsed = future.result()
-                  completed += 1
-
-                  if playable:
-                      valid_urls.add(entry["url"])
-                      status = "可播放"
+                  if reachable:
+                      reachable_entries.append(entry)
+                      status = "连通"
                   else:
                       status = "失效"
 
                   print(
-                      f"[{completed}/{len(entries)}] "
-                      f"{status} {elapsed}s "
-                      f"{entry['name']} -> {entry['url']}"
+                      f"[{index}/{total}] "
+                      f"{status}：{entry['name']}"
                   )
 
+          if len(reachable_entries) < 10:
+              print(
+                  f"只检测到 {len(reachable_entries)} 条连通链接，"
+                  "可能发生网络异常，拒绝覆盖原文件。"
+              )
+              sys.exit(1)
+
+          group_order = {
+              "央视频道": 0,
+              "卫视频道": 1,
+              "地方频道": 2,
+              "港澳台频道": 3,
+              "其他频道": 4,
+          }
+
+          def natural_sort_key(entry):
+              name = entry["name"]
+
+              cctv_match = re.match(
+                  r"^CCTV(\d+)(\+)?(.*)$",
+                  name,
+                  flags=re.IGNORECASE,
+              )
+
+              if cctv_match:
+                  return (
+                      group_order[entry["group"]],
+                      0,
+                      int(cctv_match.group(1)),
+                      1 if cctv_match.group(2) else 0,
+                      cctv_match.group(3),
+                      entry["url"],
+                  )
+
+              parts = re.split(r"(\d+)", name)
+
+              natural_name = tuple(
+                  int(part) if part.isdigit()
+                  else part.lower()
+                  for part in parts
+              )
+
+              return (
+                  group_order[entry["group"]],
+                  1,
+                  natural_name,
+                  entry["url"],
+              )
+
+          reachable_entries.sort(key=natural_sort_key)
+
+          grouped = OrderedDict(
+              (group, [])
+              for group in group_order
+          )
+
+          for entry in reachable_entries:
+              grouped[entry["group"]].append(entry)
+
           output_lines = []
-          written_urls = set()
-          valid_count = 0
 
-          for section in sections:
-              valid_entries = []
-
-              for entry in section["entries"]:
-                  url = entry["url"]
-
-                  if url not in valid_urls:
-                      continue
-
-                  # 删除完全重复的播放地址
-                  if url in written_urls:
-                      continue
-
-                  written_urls.add(url)
-                  valid_entries.append(entry["line"])
-
-              if not valid_entries:
+          for group, group_entries in grouped.items():
+              if not group_entries:
                   continue
 
               if output_lines:
                   output_lines.append("")
 
-              if section["header"]:
-                  output_lines.append(section["header"])
+              output_lines.append(f"{group},#genre#")
 
-              output_lines.extend(valid_entries)
-              valid_count += len(valid_entries)
+              for entry in group_entries:
+                  output_lines.append(
+                      f"{entry['name']},{entry['url']}"
+                  )
 
-          # 防止检测环境整体故障时清空原文件
-          if valid_count < 10:
-              print(
-                  f"错误：只检测到 {valid_count} 条有效链接，"
-                  "可能是 GitHub 网络或检测环境异常，拒绝覆盖原文件。"
-              )
-              sys.exit(1)
-
-          OUTPUT.write_text(
+          Path("IPTV_OK.txt.tmp").write_text(
               "\n".join(output_lines) + "\n",
-              encoding="utf-8"
+              encoding="utf-8",
           )
 
-          print(f"检测完成：")
-          print(f"源链接数量：{len(entries)}")
-          print(f"有效链接数量：{valid_count}")
-          print(f"失效链接数量：{len(entries) - valid_count}")
+          print(
+              f"检测完成："
+              f"{len(reachable_entries)}/{total} 条链接可以连接"
+          )
           PY
 
       - name: Replace IPTV_OK.txt
         shell: bash
         run: |
           set -euo pipefail
+
           mv IPTV_OK.txt.tmp IPTV_OK.txt
-          rm -f IPTV_SOURCE.txt
+          rm -f source-1.txt source-2.m3u source-3.m3u
 
       - name: Commit and push changes
         shell: bash
@@ -268,7 +527,7 @@ jobs:
           set -euo pipefail
 
           if git diff --quiet -- IPTV_OK.txt; then
-            echo "有效链接列表没有变化，无需提交"
+            echo "内容没有变化，无需提交"
             exit 0
           fi
 
@@ -277,5 +536,5 @@ jobs:
             "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add IPTV_OK.txt
-          git commit -m "自动检测并更新 IPTV 链接"
+          git commit -m "自动合并并检测 IPTV 链接"
           git push
