@@ -1,7 +1,6 @@
 name: 自动同步iptv4.txt到IPTV_OK.txt
 on:
   schedule:
-    # UTC每6小时执行，对应北京时间 +8小时
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
@@ -19,7 +18,7 @@ jobs:
 
       - name: 下载远程 iptv4.txt 覆盖本地 IPTV_OK.txt
         run: |
-          curl -fsSL "shturl.cc/wOsnFASQNJNr0ciXcTT8gxK9" -o ./IPTV_OK.txt
+          curl -fsSL "https://shturl.cc/h5M/tv/iptv4.txt" -o ./IPTV_OK.txt
 
       - name: 判断变更并提交推送
         run: |
