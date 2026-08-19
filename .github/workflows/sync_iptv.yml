@@ -1,0 +1,34 @@
+name: 自动同步iptv4.txt到IPTV_OK.txt
+on:
+  schedule:
+    # UTC每6小时执行，对应北京时间 +8小时
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载远程 iptv4.txt 覆盖本地 IPTV_OK.txt
+        run: |
+          curl -fsSL "shturl.cc/wOsnFASQNJNr0ciXcTT8gxK9" -o ./IPTV_OK.txt
+
+      - name: 判断变更并提交推送
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add IPTV_OK.txt
+          if git diff --cached --quiet; then
+            echo "✅ 文件无更新，跳过提交"
+          else
+            git commit -m "auto update IPTV_OK.txt $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push origin HEAD
+          fi
